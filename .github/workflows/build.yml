@@ -1,0 +1,25 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile
+        run: cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /DNDEBUG /Fe:ReforgerExternal.exe main.cpp /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup user32.lib gdi32.lib
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReforgerExternal
+          path: ReforgerExternal.exe
