@@ -1261,7 +1261,7 @@ static std::string ExeDir() {
     return (s == std::string::npos) ? std::string(".\\") : p.substr(0, s + 1);
 }
 
-struct EnumCtx { DWORD pid; HWND hwnd; };
+struct EnumCtx { DWORD pid; HWND hwnd; long bestArea; };
 
 static BOOL CALLBACK EnumProc(HWND h, LPARAM lp) {
     auto* ctx = reinterpret_cast<EnumCtx*>(lp);
@@ -1271,16 +1271,18 @@ static BOOL CALLBACK EnumProc(HWND h, LPARAM lp) {
     if (!IsWindowVisible(h)) return TRUE;
     if (GetWindow(h, GW_OWNER) != nullptr) return TRUE;
     RECT r{};
-    GetClientRect(h, &r);
-    if (r.right < 200 || r.bottom < 200) return TRUE;
-    ctx->hwnd = h;
-    return FALSE;
+    if (!GetClientRect(h, &r)) return TRUE;
+    long area = (long)(r.right - r.left) * (long)(r.bottom - r.top);
+    if (area > ctx->bestArea) { ctx->bestArea = area; ctx->hwnd = h; }
+    return TRUE;
 }
 
+// Picks the biggest visible top-level window the game owns.
 static HWND FindGameWindow(DWORD pid) {
-    EnumCtx ctx{ pid, nullptr };
+    EnumCtx ctx{ pid, nullptr, 0 };
     EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&ctx));
     return ctx.hwnd;
+}
 }
 
 // ===========================================================================
@@ -1531,7 +1533,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     bool scanRequested = false;
     double last = Now();
 
-    while (true) {
+while (true) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
         if (KeyPressed(VK_END)) break;
         if (KeyPressed(VK_HOME)) scanRequested = true;
 
@@ -1547,14 +1555,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         if (dt > 0.25f) dt = 0.25f;
         if (dt <= 0.f)  dt = 1.f / 240.f;
 
-        HWND gameWnd = FindGameWindow(mem.pid);
-        if (!gameWnd) { Sleep(150); continue; }
-
-        RECT cr{};
-        GetClientRect(gameWnd, &cr);
-        POINT tl{ 0, 0 };
-        ClientToScreen(gameWnd, &tl);
-        g_overlay.SetBounds(tl.x, tl.y, cr.right, cr.bottom);
+      HWND gameWnd = FindGameWindow(mem.pid);
+        int ox = 0, oy = 0, ow = 0, oh = 0;
+        if (gameWnd) {
+            RECT cr{};
+            GetClientRect(gameWnd, &cr);
+            POINT tl{ 0, 0 };
+            ClientToScreen(gameWnd, &tl);
+            ox = tl.x; oy = tl.y; ow = cr.right; oh = cr.bottom;
+        }
+        if (ow < 200 || oh < 200) {          // minimized or not found: use the screen
+            ox = 0; oy = 0;
+            ow = GetSystemMetrics(SM_CXSCREEN);
+            oh = GetSystemMetrics(SM_CYSCREEN);
+        }
+        g_overlay.SetBounds(ox, oy, ow, oh);
 
         HandleHotkeys();
 
@@ -1573,7 +1588,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
 
         g_overlay.Begin();
         DrawEsp(st);
-        if (GetForegroundWindow() == gameWnd)
+        if (!gameWnd || GetForegroundWindow() == gameWnd)
             UpdateAimbot(st, dt, accum, lastTarget, jitter);
         DrawMenu(st);
         g_overlay.Present();
