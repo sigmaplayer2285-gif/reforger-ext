@@ -2,6 +2,7 @@ name: build
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -16,7 +17,15 @@ jobs:
           arch: x64
 
       - name: Compile
-        run: cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /DNDEBUG /Fe:ReforgerExternal.exe main.cpp /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup user32.lib gdi32.lib
+        run: >
+          cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /DNDEBUG
+          /DUNICODE /D_UNICODE
+          /Fe:ReforgerExternal.exe main.cpp
+          /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup
+          user32.lib gdi32.lib psapi.lib
+
+      - name: Verify architecture
+        run: dumpbin /headers ReforgerExternal.exe | findstr machine
 
       - name: Upload exe
         uses: actions/upload-artifact@v4
