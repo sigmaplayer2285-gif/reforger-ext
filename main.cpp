@@ -965,7 +965,7 @@ private:
         return true;
     }
 
-    void ReadSkeleton(PlayerEntity& p, const uint8_t* block, int w, int h) {
+    void ReadSkeleton(GameState& st, PlayerEntity& p, const uint8_t* block, int w, int h) {
         p.boneOk.fill(0);
         p.headBoneOk = false;
         if (!off.BonesList || off.BoneChain1 >= 0x200) return;
@@ -1105,7 +1105,7 @@ private:
             p.onScreen = WorldToScreen(st.camera, head, p.headScreen, w, h);
             if (p.onScreen) WorldToScreen(st.camera, pos, p.feetScreen, w, h);
 
-            if (!local && dist <= skeletonMaxDistance) ReadSkeleton(p, block, w, h);
+            if (!local && dist <= skeletonMaxDistance) ReadSkeleton(st, p, block, w, h);
 
             p.aimWorld    = p.headBoneOk ? p.headBoneWorld : head;
             p.aimOnScreen = WorldToScreen(st.camera, p.aimWorld, p.aimScreen, w, h);
