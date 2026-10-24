@@ -13,6 +13,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -27,6 +28,7 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "psapi.lib")
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
@@ -68,21 +70,60 @@ public:
     size_t       moduleSize = 0;
     std::wstring moduleName;
 
-    bool Attach(const std::vector<std::wstring>& candidates) {
-        for (const auto& name : candidates) {
-            DWORD p = FindProcessId(name);
-            if (!p) continue;
+    // diagnostics
+    std::wstring              lastError;
+    std::vector<std::wstring> seenProcesses;
 
-            HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, p);
-            if (!h) h = OpenProcess(PROCESS_VM_READ, FALSE, p);
-            if (!h) continue;
+    bool Attach() {
+        lastError.clear();
+        seenProcesses.clear();
 
-            uintptr_t base = 0; size_t size = 0;
-            if (!FindModule(p, name, base, size)) { CloseHandle(h); continue; }
+        std::vector<ProcHit> hits;
+        if (!CollectGameProcesses(hits)) {
+            lastError = L"CreateToolhelp32Snapshot failed.";
+            return false;
+        }
+        for (const auto& h : hits) seenProcesses.push_back(h.exe);
+        if (hits.empty()) {
+            lastError = L"No process whose name starts with \"ArmaReforger\" is running.";
+            return false;
+        }
 
-            handle = h; pid = p; moduleBase = base; moduleSize = size; moduleName = name;
+        // Prefer the process that owns a real window; push dedicated servers last.
+        std::stable_sort(hits.begin(), hits.end(), [](const ProcHit& a, const ProcHit& b) {
+            const bool sa = IsServer(a.exe), sb = IsServer(b.exe);
+            if (sa != sb) return !sa;
+            const bool wa = HasMainWindow(a.pid), wb = HasMainWindow(b.pid);
+            return wa && !wb;
+        });
+
+        DWORD lastErr = 0;
+        for (const auto& h : hits) {
+            if (IsServer(h.exe)) continue;
+
+            HANDLE ph = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, h.pid);
+            if (!ph) ph = OpenProcess(PROCESS_VM_READ, FALSE, h.pid);
+            if (!ph) { lastErr = GetLastError(); continue; }
+
+            uintptr_t base = 0;
+            size_t    size = 0;
+            if (!FindModule(ph, h.pid, h.exe, base, size) && !FindMainModule(ph, base, size)) {
+                lastErr = GetLastError();
+                CloseHandle(ph);
+                continue;
+            }
+
+            handle     = ph;
+            pid        = h.pid;
+            moduleBase = base;
+            moduleSize = size;
+            moduleName = h.exe;
             return true;
         }
+
+        lastError = (lastErr == ERROR_ACCESS_DENIED)
+            ? L"Process found, but OpenProcess was DENIED. Run this as Administrator."
+            : L"Process found, but it could not be opened or read.";
         return false;
     }
 
@@ -180,24 +221,52 @@ public:
     }
 
 private:
-    static DWORD FindProcessId(const std::wstring& name) {
+    struct ProcHit { DWORD pid; std::wstring exe; };
+    struct WinCtx  { DWORD pid; bool found; };
+
+    static bool IsServer(const std::wstring& n) {
+        return _wcsnicmp(n.c_str(), L"ArmaReforgerServer", 18) == 0;
+    }
+
+    static BOOL CALLBACK WindowProcCb(HWND h, LPARAM lp) {
+        auto* c = reinterpret_cast<WinCtx*>(lp);
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(h, &wpid);
+        if (wpid == c->pid && IsWindowVisible(h) && GetWindow(h, GW_OWNER) == nullptr) {
+            c->found = true;
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    static bool HasMainWindow(DWORD pid) {
+        WinCtx c{ pid, false };
+        EnumWindows(WindowProcCb, reinterpret_cast<LPARAM>(&c));
+        return c.found;
+    }
+
+    // Prefix match: catches ArmaReforgerSteam / _BE / SteamDiag / MS / anything renamed.
+    static bool CollectGameProcesses(std::vector<ProcHit>& out) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE) return 0;
-        PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
-        DWORD result = 0;
+        if (snap == INVALID_HANDLE_VALUE) return false;
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
         if (Process32FirstW(snap, &pe)) {
             do {
-                if (_wcsicmp(pe.szExeFile, name.c_str()) == 0) { result = pe.th32ProcessID; break; }
+                if (_wcsnicmp(pe.szExeFile, L"ArmaReforger", 12) == 0)
+                    out.push_back({ pe.th32ProcessID, pe.szExeFile });
             } while (Process32NextW(snap, &pe));
         }
         CloseHandle(snap);
-        return result;
+        return true;
     }
 
-    static bool FindModule(DWORD pid, const std::wstring& name, uintptr_t& base, size_t& size) {
+    static bool FindModule(HANDLE, DWORD pid, const std::wstring& name,
+                           uintptr_t& base, size_t& size) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         if (snap == INVALID_HANDLE_VALUE) return false;
-        MODULEENTRY32W me{}; me.dwSize = sizeof(me);
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
         bool found = false;
         if (Module32FirstW(snap, &me)) {
             do {
@@ -211,6 +280,18 @@ private:
         }
         CloseHandle(snap);
         return found;
+    }
+
+    // Fallback for when the toolhelp module snapshot refuses to cooperate.
+    static bool FindMainModule(HANDLE ph, uintptr_t& base, size_t& size) {
+        HMODULE mods[1]{};
+        DWORD needed = 0;
+        if (!EnumProcessModulesEx(ph, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) return false;
+        MODULEINFO mi{};
+        if (!GetModuleInformation(ph, mods[0], &mi, sizeof(mi))) return false;
+        base = (uintptr_t)mi.lpBaseOfDll;
+        size = (size_t)mi.SizeOfImage;
+        return base != 0;
     }
 };
 
@@ -1350,158 +1431,4 @@ static void UpdateAimbot(const GameState& st, float dt,
     float dx = target.x - cx;
     float dy = target.y - cy;
 
-    if (g_cfg.humanize) {
-        if (best->address != lastTarget) {
-            jitter.x = RandFloat(-g_cfg.jitter, g_cfg.jitter);
-            jitter.y = RandFloat(-g_cfg.jitter, g_cfg.jitter);
-            lastTarget = best->address;
-        }
-        jitter.x += RandFloat(-0.06f, 0.06f);
-        jitter.y += RandFloat(-0.06f, 0.06f);
-        if (jitter.x >  g_cfg.jitter) jitter.x =  g_cfg.jitter;
-        if (jitter.x < -g_cfg.jitter) jitter.x = -g_cfg.jitter;
-        if (jitter.y >  g_cfg.jitter) jitter.y =  g_cfg.jitter;
-        if (jitter.y < -g_cfg.jitter) jitter.y = -g_cfg.jitter;
-        dx += jitter.x;
-        dy += jitter.y;
-    }
-
-    if (fabsf(dx) < 0.6f && fabsf(dy) < 0.6f) return;
-
-    float alpha = 1.f - expf(-g_cfg.aimSpeed * dt);
-    if (alpha > 1.f) alpha = 1.f;
-    if (alpha < 0.f) alpha = 0.f;
-
-    accum.x += dx * alpha * g_cfg.aimScale;
-    accum.y += dy * alpha * g_cfg.aimScale;
-
-    LONG ix = (LONG)accum.x, iy = (LONG)accum.y;
-    accum.x -= (float)ix;
-    accum.y -= (float)iy;
-    if (!ix && !iy) return;
-
-    INPUT in = {};
-    in.type       = INPUT_MOUSE;
-    in.mi.dx      = ix;
-    in.mi.dy      = iy;
-    in.mi.dwFlags = MOUSEEVENTF_MOVE;
-    SendInput(1, &in, sizeof(INPUT));
-}
-
-static void HandleHotkeys() {
-    if (KeyPressed(VK_INSERT)) g_showMenu       = !g_showMenu;
-    if (KeyPressed(VK_F1))  g_cfg.espEnabled    = !g_cfg.espEnabled;
-    if (KeyPressed(VK_F2))  g_cfg.boxEsp        = !g_cfg.boxEsp;
-    if (KeyPressed(VK_F3))  g_cfg.snaplines     = !g_cfg.snaplines;
-    if (KeyPressed(VK_F4))  g_cfg.showNames     = !g_cfg.showNames;
-    if (KeyPressed(VK_F5))  g_cfg.healthBar     = !g_cfg.healthBar;
-    if (KeyPressed(VK_F6))  g_cfg.showDistance  = !g_cfg.showDistance;
-    if (KeyPressed(VK_F7))  g_cfg.aimEnabled    = !g_cfg.aimEnabled;
-    if (KeyPressed(VK_F8))  g_cfg.fovCircle     = !g_cfg.fovCircle;
-    if (KeyPressed(VK_F9))  g_cfg.humanize      = !g_cfg.humanize;
-    if (KeyPressed(VK_F10)) g_cfg.predict       = !g_cfg.predict;
-    if (KeyPressed(VK_F11)) g_cfg.skeleton      = !g_cfg.skeleton;
-    if (KeyPressed(VK_F12)) g_cfg.teamCheck     = !g_cfg.teamCheck;
-}
-
-// ===========================================================================
-//  entry
-// ===========================================================================
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    srand((unsigned)GetTickCount64());
-
-    const std::string dir     = ExeDir();
-    const std::string cfgPath = dir + "config.ini";
-    const std::string offPath = dir + "offsets.ini";
-
-    LoadOffsets(offPath.c_str(), g_off);
-    SaveOffsets(offPath.c_str(), g_off);
-    LoadConfig(cfgPath.c_str(), g_cfg);
-    SaveConfig(cfgPath.c_str(), g_cfg);
-
-    Memory mem;
-    if (!mem.Attach({ L"ArmaReforgerSteam.exe", L"ArmaReforgerMS.exe",
-                      L"ArmaReforger.exe", L"ArmaReforgerDiag.exe" })) {
-        MessageBoxA(nullptr,
-            "ArmaReforger*.exe not found.\n\n"
-            "Start the game first, then run this.\n"
-            "If it still fails, run this as Administrator.",
-            "Reforger External", MB_ICONINFORMATION);
-        return 0;
-    }
-
-    if (!g_overlay.Create()) {
-        MessageBoxA(nullptr, "Failed to create overlay window.", "Reforger External", MB_ICONERROR);
-        return 0;
-    }
-
-    g_game.mem = &mem;
-
-    GameState st;
-    Vec2 accum{ 0.f, 0.f };
-    Vec2 jitter{ 0.f, 0.f };
-    uintptr_t lastTarget = 0;
-    bool scanRequested = false;
-    double last = Now();
-
-    while (true) {
-        if (KeyPressed(VK_END)) break;
-        if (KeyPressed(VK_HOME)) scanRequested = true;
-
-        if (!mem.Alive()) {
-            mem.Detach();
-            if (!mem.Attach({ L"ArmaReforgerSteam.exe", L"ArmaReforgerMS.exe",
-                              L"ArmaReforger.exe", L"ArmaReforgerDiag.exe" })) {
-                Sleep(500);
-                continue;
-            }
-            g_game.mem = &mem;
-        }
-
-        const double now = Now();
-        float dt = (float)(now - last);
-        last = now;
-        if (dt > 0.25f) dt = 0.25f;
-        if (dt <= 0.f)  dt = 1.f / 240.f;
-
-        HWND gameWnd = FindGameWindow(mem.pid);
-        if (!gameWnd) { Sleep(150); continue; }
-
-        RECT cr{};
-        GetClientRect(gameWnd, &cr);
-        POINT tl{ 0, 0 };
-        ClientToScreen(gameWnd, &tl);
-        g_overlay.SetBounds(tl.x, tl.y, cr.right, cr.bottom);
-
-        HandleHotkeys();
-
-        g_game.off                 = g_off;
-        g_game.maxDistance         = g_cfg.maxDistance;
-        g_game.aimHeight           = g_cfg.aimHeight;
-        g_game.maxEntities         = g_cfg.maxEntities;
-        g_game.showLocal           = g_cfg.showLocal;
-        g_game.teamCheck           = g_cfg.teamCheck;
-        g_game.skeletonMaxDistance = g_cfg.skeletonMaxDistance;
-        g_game.skeletonMaxCount    = g_cfg.skeletonMaxCount;
-
-        g_game.Update(st, g_overlay.Width(), g_overlay.Height(), now);
-
-        if (scanRequested && st.ok) { g_game.RunFactionScan(st); scanRequested = false; }
-
-        g_overlay.Begin();
-        DrawEsp(st);
-        if (GetForegroundWindow() == gameWnd)
-            UpdateAimbot(st, dt, accum, lastTarget, jitter);
-        DrawMenu(st);
-        g_overlay.Present();
-
-        Sleep(1);
-    }
-
-    SaveConfig(cfgPath.c_str(), g_cfg);
-    SaveOffsets(offPath.c_str(), g_off);
-    g_overlay.Destroy();
-    mem.Detach();
-    return 0;
-}
+    if
