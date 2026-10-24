@@ -1283,7 +1283,6 @@ static HWND FindGameWindow(DWORD pid) {
     EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&ctx));
     return ctx.hwnd;
 }
-}
 
 // ===========================================================================
 //  drawing
